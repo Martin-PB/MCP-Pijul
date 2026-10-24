@@ -185,7 +185,37 @@ fn run_pijul(repo_path: Option<&str>, args: &[&str]) -> (bool, String) {
     }
 }
 
+/// Tools that mutate the repository or its remotes. In read-only mode
+/// (PIJUL_MCP_READONLY set to a truthy value) these are rejected up front,
+/// before any pijul subprocess is spawned, so the guarantee holds even on
+/// machines where pijul is not installed.
+const WRITE_TOOLS: [&str; 7] = [
+    "pijul_record",
+    "pijul_channel_create",
+    "pijul_channel_switch",
+    "pijul_apply",
+    "pijul_unrecord",
+    "pijul_pull",
+    "pijul_push",
+];
+
+fn read_only() -> bool {
+    std::env::var("PIJUL_MCP_READONLY")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "no"
+        })
+        .unwrap_or(false)
+}
+
 fn call_tool(name: &str, args: &Value) -> Value {
+    if read_only() && WRITE_TOOLS.contains(&name) {
+        return error_result(&format!(
+            "read-only mode: `{name}` is disabled (PIJUL_MCP_READONLY is set). \
+             Only inspection tools (pijul_status, pijul_log, pijul_diff, \
+             pijul_channel_list, pijul_conflict_show) are available."
+        ));
+    }
     let repo = args.get("repo_path").and_then(Value::as_str);
     let (ok, out) = match name {
         "pijul_status" => run_pijul(repo, &["status"]),
@@ -294,6 +324,9 @@ fn respond_error(id: Value, code: i64, message: &str, out: &mut impl Write) {
 }
 
 fn main() {
+    if read_only() {
+        eprintln!("mcp-server-pijul: read-only mode (PIJUL_MCP_READONLY) — mutating tools are disabled");
+    }
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
