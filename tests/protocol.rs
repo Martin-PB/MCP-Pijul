@@ -99,6 +99,7 @@ fn tools_list_exposes_the_twelve_tools() {
     let resp = s.rpc(9, "tools/list", Value::Null);
     let tools = resp["result"]["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 12, "exactly the 12 documented tools");
+    assert_eq!(tools.len(), 13, "12 tools + pijul_merge_preview (backlog 1.3)");
     for t in tools {
         assert!(t["name"].as_str().unwrap().starts_with("pijul_"));
         assert!(t["description"].as_str().unwrap().len() > 20);
