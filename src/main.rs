@@ -151,6 +151,20 @@ fn tools() -> Vec<Tool> {
             }),
         },
         Tool {
+            name: "pijul_merge_preview",
+            description: "Preview merging channel `source` into channel `target` (default: the current channel). Lists the changes present on source but missing on target, in ready-to-apply order, WITHOUT touching the repository. Set apply=true to perform the merge (pijul apply --channel: dependencies follow automatically; conflicts are first-class, inspect them with pijul_conflict_show).",
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_path": {"type": "string"},
+                    "source": {"type": "string", "description": "Channel to merge FROM"},
+                    "target": {"type": "string", "description": "Channel to merge INTO (default: current channel)"},
+                    "apply": {"type": "boolean", "description": "Perform the merge instead of only previewing it (default: false)"}
+                },
+                "required": ["source"]
+            }),
+        },
+        Tool {
             name: "pijul_conflict_show",
             description: "List files containing unresolved conflicts in the working copy. In Pijul conflicts are first-class: they are a state of the graph, resolvable by recording a new change.",
             schema: json!({
@@ -213,7 +227,7 @@ fn call_tool(name: &str, args: &Value) -> Value {
         return error_result(&format!(
             "read-only mode: `{name}` is disabled (PIJUL_MCP_READONLY is set). \
              Only inspection tools (pijul_status, pijul_log, pijul_diff, \
-             pijul_channel_list, pijul_conflict_show) are available."
+             pijul_channel_list, pijul_conflict_show, and pijul_merge_preview in preview-only mode) are available."
         ));
     }
     let repo = args.get("repo_path").and_then(Value::as_str);
@@ -286,6 +300,7 @@ fn call_tool(name: &str, args: &Value) -> Value {
                 (false, false) => run_pijul(repo, &["push", remote, "--to-channel", channel]),
             }
         }
+        "pijul_merge_preview" => return merge_preview(repo, args),
         "pijul_conflict_show" => run_pijul(repo, &["conflict", "show"]),
         other => return error_result(&format!("unknown tool: {other}")),
     };
@@ -293,6 +308,141 @@ fn call_tool(name: &str, args: &Value) -> Value {
         text_result(&out)
     } else {
         error_result(&out)
+    }
+}
+
+use std::collections::HashSet;
+
+/// Hashes recorded on a channel (`pijul log --hash-only --channel`), newest first.
+fn channel_hashes(repo: Option<&str>, channel: &str) -> Result<Vec<String>, String> {
+    let (ok, out) = run_pijul(repo, &["log", "--hash-only", "--channel", channel]);
+    if !ok {
+        return Err(format!("pijul log --channel {channel} failed: {out}"));
+    }
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Name of the channel currently in use (the one starred by `pijul channel`).
+fn current_channel(repo: Option<&str>) -> Result<String, String> {
+    let (ok, out) = run_pijul(repo, &["channel"]);
+    if !ok {
+        return Err(format!("pijul channel failed: {out}"));
+    }
+    out.lines()
+        .map(str::trim)
+        .find(|l| l.starts_with('*'))
+        .map(|l| l.trim_start_matches('*').trim().to_string())
+        .ok_or_else(|| "cannot determine the current channel".to_string())
+}
+
+/// pijul_merge_preview: analyse the patch-set difference between two channels
+/// (source -> target) without touching anything; optionally apply the
+/// missing changes with `pijul apply --channel`, which pulls dependencies
+/// along. This mirrors the manual's channel-merge workflow: in Pijul, merge
+/// and rebase are the same operation and conflicts are first-class.
+fn merge_preview(repo: Option<&str>, args: &Value) -> Value {
+    let Some(source) = args
+        .get("source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return error_result("`source` is required for pijul_merge_preview");
+    };
+    let target = args
+        .get("target")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let do_apply = args.get("apply").and_then(Value::as_bool).unwrap_or(false);
+    if do_apply && read_only() {
+        return error_result(
+            "read-only mode (PIJUL_MCP_READONLY): pijul_merge_preview is limited to \
+             previewing; apply=true is disabled",
+        );
+    }
+
+    let target = match target {
+        Some(t) => t.to_string(),
+        None => match current_channel(repo) {
+            Ok(t) => t,
+            Err(e) => error_result(&e),
+        },
+    };
+    if source == target {
+        return error_result(&format!(
+            "source and target are the same channel (\"{source}\"): nothing to merge"
+        ));
+    }
+
+    let src = match channel_hashes(repo, &source) {
+        Ok(h) => h,
+        Err(e) => return error_result(&e),
+    };
+    let dst = match channel_hashes(repo, &target) {
+        Ok(h) => h,
+        Err(e) => return error_result(&e),
+    };
+    let dst_set: HashSet<&String> = dst.iter().collect();
+    let missing: Vec<&String> = src.iter().filter(|h| !dst_set.contains(*h)).collect();
+    let common = src.len() - missing.len();
+
+    // `pijul log` is newest-first; `pijul apply` wants oldest-first so that
+    // dependencies are already in place (they would be pulled along anyway,
+    // but a deterministic order keeps previews reproducible).
+    let oldest_first: Vec<&String> = missing.iter().rev().cloned().collect();
+
+    let mut report = format!(
+        "merge preview: channel \"{source}\" -> channel \"{target}\"\n\
+         changes on source: {} | already on target: {} | to merge: {}\n",
+        src.len(),
+        common,
+        missing.len()
+    );
+    if missing.is_empty() {
+        report.push_str("nothing to do: every change on source is already on target.\n");
+        return text_result(&report);
+    }
+    report.push_str("changes to apply (oldest first):\n");
+    for h in &oldest_first {
+        report.push_str(&format!("  {h}\n"));
+    }
+    if !do_apply {
+        report.push_str(
+            "preview only (nothing was modified). set apply=true to merge, then use \
+             pijul_conflict_show to inspect first-class conflicts.\n",
+        );
+        return text_result(&report);
+    }
+
+    report.push_str("applying...\n");
+    let mut failures = 0;
+    for h in &oldest_first {
+        let (ok, out) = run_pijul(repo, &["apply", "--channel", &target, h]);
+        if ok {
+            report.push_str(&format!("  applied {h}\n"));
+        } else {
+            failures += 1;
+            report.push_str(&format!("  FAILED {h}: {out}\n"));
+        }
+    }
+    if failures == 0 {
+        report.push_str(&format!(
+            "merge complete: {}/{} changes applied to channel \"{target}\". \
+             use pijul_conflict_show to inspect conflicts, then record the resolution.\n",
+            oldest_first.len(),
+            oldest_first.len()
+        ));
+        text_result(&report)
+    } else {
+        error_result(&format!(
+            "{failures} change(s) failed to apply:\n\n{report}"
+        ))
     }
 }
 
