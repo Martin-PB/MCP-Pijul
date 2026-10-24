@@ -22,7 +22,7 @@ concurrency:
 
 env:
   # Bump to refresh the cache when targeting a newer pijul.
-  PIJUL_VERSION: "~1.0.0-beta"
+  PIJUL_VERSION: "1.0.0-beta.24"
 
 jobs:
   repositories:
@@ -42,4 +42,4 @@ jobs:
       - name: Repository tests against generated pijul repos
         env:
           PATH: "/home/runner/.cargo/bin:${{ github.workspace }}/target/debug:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-        run: cargo test --locked --test repositories
+        run: cargo test --test repositories

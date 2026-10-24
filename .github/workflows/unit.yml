@@ -24,8 +24,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build
-        run: cargo build --locked
+        run: cargo build
+        # No --locked: the repository does not commit Cargo.lock yet.
+        # Re-adding --locked requires committing a generated Cargo.lock.
       - name: Protocol tests (no pijul required)
-        run: cargo test --locked --test protocol
+        run: cargo test --test protocol
       - name: Repository tests (skip if pijul absent)
-        run: cargo test --locked --test repositories
+        run: cargo test --test repositories
