@@ -213,6 +213,27 @@ const WRITE_TOOLS: [&str; 7] = [
     "pijul_push",
 ];
 
+/// Tools that should carry destructiveHint: true in their MCP annotations
+/// (they remove or invalidate already-recorded state).
+const DESTRUCTIVE_TOOLS: [&str; 1] = ["pijul_unrecord"];
+
+/// Tools that may interact with the outside world (remotes): openWorldHint.
+const NETWORK_TOOLS: [&str; 2] = ["pijul_pull", "pijul_push"];
+
+/// MCP tool annotations (spec 2025-06-18): hints only — the server's
+/// own read-only guard (PIJUL_MCP_READONLY) remains the real enforcement.
+/// - readOnlyHint: the 5 inspection tools; NOT pijul_merge_preview, whose
+///   apply=true variant mutates the target channel.
+/// - destructiveHint: pijul_unrecord only.
+/// - openWorldHint: pijul_pull / pijul_push (network remotes).
+fn annotations_for(name: &str) -> Value {
+    json!({
+        "readOnlyHint": !WRITE_TOOLS.contains(&name) && name != "pijul_merge_preview",
+        "destructiveHint": DESTRUCTIVE_TOOLS.contains(&name),
+        "openWorldHint": NETWORK_TOOLS.contains(&name),
+    })
+}
+
 fn read_only() -> bool {
     std::env::var("PIJUL_MCP_READONLY")
         .map(|v| {
@@ -511,7 +532,7 @@ fn main() {
             "tools/list" => {
                 let list: Vec<Value> = tools()
                     .into_iter()
-                    .map(|t| json!({"name": t.name, "description": t.description, "inputSchema": t.schema}))
+                    .map(|t| json!({"name": t.name, "description": t.description, "inputSchema": t.schema, "annotations": annotations_for(t.name)}))
                     .collect();
                 respond(id, json!({"tools": list}), &mut out);
             }
