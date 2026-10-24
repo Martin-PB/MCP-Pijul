@@ -1,0 +1,31 @@
+name: unit
+
+# Always-on, fast: build + protocol tests. Runs WITHOUT the pijul binary —
+# tests/repositories.rs skips itself; tests/protocol.rs proves the
+# no-pijul degradation contract. Economy: no expensive install here.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --locked
+      - name: Protocol tests (no pijul required)
+        run: cargo test --locked --test protocol
+      - name: Repository tests (skip if pijul absent)
+        run: cargo test --locked --test repositories
