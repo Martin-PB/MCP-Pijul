@@ -227,7 +227,7 @@ fn call_tool(name: &str, args: &Value) -> Value {
         return error_result(&format!(
             "read-only mode: `{name}` is disabled (PIJUL_MCP_READONLY is set). \
              Only inspection tools (pijul_status, pijul_log, pijul_diff, \
-             pijul_channel_list, pijul_conflict_show) are available."
+             pijul_channel_list, pijul_conflict_show, and pijul_merge_preview in preview-only mode) are available."
         ));
     }
     let repo = args.get("repo_path").and_then(Value::as_str);
@@ -360,6 +360,12 @@ fn merge_preview(repo: Option<&str>, args: &Value) -> Value {
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let do_apply = args.get("apply").and_then(Value::as_bool).unwrap_or(false);
+    if do_apply && read_only() {
+        return error_result(
+            "read-only mode (PIJUL_MCP_READONLY): pijul_merge_preview is limited to \
+             previewing; apply=true is disabled",
+        );
+    }
 
     let target = match target {
         Some(t) => t.to_string(),
