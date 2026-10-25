@@ -58,11 +58,16 @@ cargo build --quiet
 
 # --- Unit tests (no pijul required) ----------------------------------------
 
-step "Protocol tests (no pijul required)"
+step "Protocol and hardening tests (no pijul required)"
 if cargo test --quiet --test protocol; then
     ok "cargo test --test protocol"
 else
     ko "cargo test --test protocol"
+fi
+if cargo test --quiet --test hardening; then
+    ok "cargo test --test hardening"
+else
+    ko "cargo test --test hardening"
 fi
 
 # --- Tests that need pijul ---------------------------------------------------

@@ -98,7 +98,7 @@ fn readonly_still_lists_all_tools() {
     let mut s = Server::start(true);
     let resp = s.request(1, "tools/list", json!({}));
     let tools = resp["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 12, "read-only mode must not hide tools from tools/list");
+    assert_eq!(tools.len(), 13, "read-only mode must not hide tools from tools/list");
     assert!(tools.iter().any(|t| t["name"] == "pijul_record"));
     assert!(tools.iter().any(|t| t["name"] == "pijul_status"));
 }
