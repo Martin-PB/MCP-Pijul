@@ -9,14 +9,164 @@
 // - Patch-native philosophy: tools expose changes/channels (Pijul's model),
 //   not branches/rebases (Git's model). Agents get commutation and
 //   first-class conflicts for free.
+// - Production hardening: every pijul subprocess runs under a wall-clock
+//   timeout (kill on expiry), repo_path arguments are validated before
+//   any subprocess is spawned, and initialize negotiates the protocol
+//   version per the MCP spec.
 
 use serde_json::{json, Value};
-use std::io::{BufRead, Write};
-use std::process::Command;
+use std::io::{BufRead, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "mcp-server-pijul";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Default wall-clock budget for one pijul subprocess. Remote operations
+/// (pull/push) on large repositories can legitimately take a while, so the
+/// default is generous; agents that need tighter bounds can set
+/// PIJUL_MCP_TIMEOUT_SECS.
+const DEFAULT_TIMEOUT_SECS: u64 = 60;
+
+fn timeout_secs() -> u64 {
+    std::env::var("PIJUL_MCP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+}
+
+/// Optional allowlist of repository roots (PIJUL_MCP_ALLOWED_ROOTS, an
+/// OS-style path list separated by ':'). When set, every repo_path argument
+/// must resolve (after symlink canonicalization) under one of the roots;
+/// anything else is rejected before a subprocess is spawned. When unset
+/// (single-user local usage), all existing directories are accepted.
+fn allowed_roots() -> Option<Vec<PathBuf>> {
+    std::env::var("PIJUL_MCP_ALLOWED_ROOTS")
+        .ok()
+        .map(|v| {
+            v.split(':')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect()
+        })
+}
+
+/// Validate a repo_path argument before spawning anything: it must exist,
+/// be a directory, and (when PIJUL_MCP_ALLOWED_ROOTS is set) live under one
+/// of the allowlisted roots. An empty/absent repo_path is fine (default:
+/// the working directory of the server process).
+fn validate_repo_path(repo_path: Option<&str>) -> Result<(), String> {
+    let Some(raw) = repo_path.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let given = Path::new(raw);
+    let abs = if given.is_absolute() {
+        given.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("cannot resolve relative repo_path \"{raw}\": {e}"))?
+            .join(given)
+    };
+    let canon = std::fs::canonicalize(&abs)
+        .map_err(|_| format!("repo_path \"{raw}\" does not exist or is not accessible"))?;
+    if !canon.is_dir() {
+        return Err(format!("repo_path \"{raw}\" is not a directory"));
+    }
+    if let Some(roots) = allowed_roots() {
+        let inside = roots.iter().any(|root| {
+            let root_canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+            canon.starts_with(&root_canon)
+        });
+        if !inside {
+            return Err(format!(
+                "repo_path \"{raw}\" is outside PIJUL_MCP_ALLOWED_ROOTS; \
+                 add its root to the allowlist or unset the variable"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn run_pijul(repo_path: Option<&str>, args: &[&str]) -> (bool, String) {
+    if let Err(msg) = validate_repo_path(repo_path) {
+        return (false, msg);
+    }
+    let secs = timeout_secs();
+    let mut cmd = Command::new("pijul");
+    cmd.args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(p) = repo_path.filter(|s| !s.trim().is_empty()) {
+        cmd.current_dir(p.trim());
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                false,
+                format!("failed to spawn pijul: {e}. Is Pijul installed and on PATH?"),
+            )
+        }
+    };
+    // Drain stdout/stderr on reader threads so a chatty pijul can never
+    // fill the pipe buffer and deadlock the timeout poll below.
+    let mut stdout_pipe = child.stdout.take().expect("stdout piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(50));
+                } else {
+                    // Kill the subprocess and fail the tool call: a hung
+                    // pijul must never hang the whole stdio server.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return (
+                        false,
+                        format!(
+                            "pijul {} timed out after {secs}s \
+                             (tune with PIJUL_MCP_TIMEOUT_SECS)",
+                            args.join(" ")
+                        ),
+                    );
+                }
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return (false, format!("failed to wait for pijul: {e}"));
+            }
+        }
+    };
+
+    let mut text = String::from_utf8_lossy(&out_handle.join().unwrap_or_default()).into_owned();
+    let err = String::from_utf8_lossy(&err_handle.join().unwrap_or_default());
+    if !err.trim().is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(err.trim_end());
+    }
+    (status.success(), text.trim_end().to_string())
+}
 
 struct Tool {
     name: &'static str,
@@ -175,28 +325,6 @@ fn tools() -> Vec<Tool> {
             }),
         },
     ]
-}
-
-fn run_pijul(repo_path: Option<&str>, args: &[&str]) -> (bool, String) {
-    let mut cmd = Command::new("pijul");
-    cmd.args(args);
-    if let Some(p) = repo_path.filter(|s| !s.is_empty()) {
-        cmd.current_dir(p);
-    }
-    match cmd.output() {
-        Ok(out) => {
-            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-            let err = String::from_utf8_lossy(&out.stderr);
-            if !err.trim().is_empty() {
-                if !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str(err.trim_end());
-            }
-            (out.status.success(), text.trim_end().to_string())
-        }
-        Err(e) => (false, format!("failed to spawn pijul: {e}. Is Pijul installed and on PATH?")),
-    }
 }
 
 /// Tools that mutate the repository or its remotes. In read-only mode
@@ -495,9 +623,17 @@ fn respond_error(id: Value, code: i64, message: &str, out: &mut impl Write) {
 }
 
 fn main() {
-    if read_only() {
-        eprintln!("mcp-server-pijul: read-only mode (PIJUL_MCP_READONLY) — mutating tools are disabled");
-    }
+    eprintln!(
+        "mcp-server-pijul v{SERVER_VERSION}: protocol {PROTOCOL_VERSION}, \
+         pijul subprocess timeout {}s{}, read-only: {}",
+        timeout_secs(),
+        if allowed_roots().is_some() {
+            ", repo_path allowlist ON (PIJUL_MCP_ALLOWED_ROOTS)"
+        } else {
+            ""
+        },
+        read_only()
+    );
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -519,15 +655,26 @@ fn main() {
         let Some(id) = id else { continue };
 
         match method {
-            "initialize" => respond(
-                id,
-                json!({
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {"tools": {"listChanged": false}},
-                    "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}
-                }),
-                &mut out,
-            ),
+            "initialize" => {
+                // Version negotiation (MCP spec): if the client asks for
+                // the version we support, confirm it; otherwise respond
+                // with the version we actually implement so the client
+                // can decide how to proceed.
+                let requested = params.get("protocolVersion").and_then(Value::as_str);
+                let negotiated = match requested {
+                    Some(v) if v == PROTOCOL_VERSION => v,
+                    _ => PROTOCOL_VERSION,
+                };
+                respond(
+                    id,
+                    json!({
+                        "protocolVersion": negotiated,
+                        "capabilities": {"tools": {"listChanged": false}},
+                        "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}
+                    }),
+                    &mut out,
+                )
+            }
             "ping" => respond(id, json!({}), &mut out),
             "tools/list" => {
                 let list: Vec<Value> = tools()
