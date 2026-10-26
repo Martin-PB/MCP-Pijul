@@ -107,8 +107,11 @@ the freshly built server against a throwaway Pijul repository, drives a real MCP
 crates.io for the first build.
 
 ```sh
-./scripts/local-check.sh
+bash scripts/local-check.sh
 ```
+
+(Invoke it via `bash`: some commit routes do not preserve the executable bit; `chmod +x`
+works too.)
 
 Without `pijul` on `PATH`, the script degrades to the no-pijul subset, exactly like the
 CI unit job.
