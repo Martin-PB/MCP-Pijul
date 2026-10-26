@@ -157,8 +157,10 @@ fn run_pijul(repo_path: Option<&str>, args: &[&str]) -> (bool, String) {
         }
     };
 
-    let mut text = String::from_utf8_lossy(&out_handle.join().unwrap_or_default()).into_owned();
-    let err = String::from_utf8_lossy(&err_handle.join().unwrap_or_default());
+    let out_bytes = out_handle.join().unwrap_or_default();
+    let err_bytes = err_handle.join().unwrap_or_default();
+    let mut text = String::from_utf8_lossy(&out_bytes).into_owned();
+    let err = String::from_utf8_lossy(&err_bytes);
     if !err.trim().is_empty() {
         if !text.is_empty() {
             text.push('\n');
@@ -520,7 +522,7 @@ fn merge_preview(repo: Option<&str>, args: &Value) -> Value {
         Some(t) => t.to_string(),
         None => match current_channel(repo) {
             Ok(t) => t,
-            Err(e) => error_result(&e),
+            Err(e) => return error_result(&e),
         },
     };
     if source == target {

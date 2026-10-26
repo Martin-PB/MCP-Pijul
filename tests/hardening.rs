@@ -38,7 +38,7 @@ impl Server {
         let line = {
             let stdout = self.0.stdout.as_mut().expect("stdout open");
             let mut line = String::new();
-            BufReader::new(stdout)
+            BufReader::new(&mut *stdout)
                 .read_line(&mut line)
                 .expect("read response");
             line
@@ -165,11 +165,13 @@ fn hung_pijul_subprocess_is_killed_on_timeout() {
         .unwrap();
         stdin.flush().unwrap();
     }
-    let stdout = child.stdout.as_mut().unwrap();
     let mut line = String::new();
-    BufReader::new(stdout)
-        .read_line(&mut line)
-        .expect("initialize response");
+    {
+        let stdout = child.stdout.as_mut().unwrap();
+        BufReader::new(&mut *stdout)
+            .read_line(&mut line)
+            .expect("initialize response");
+    }
 
     let started = std::time::Instant::now();
     {
@@ -182,9 +184,12 @@ fn hung_pijul_subprocess_is_killed_on_timeout() {
         stdin.flush().unwrap();
     }
     let mut line = String::new();
-    BufReader::new(stdout)
-        .read_line(&mut line)
-        .expect("tool response must arrive (server must not hang)");
+    {
+        let stdout = child.stdout.as_mut().unwrap();
+        BufReader::new(&mut *stdout)
+            .read_line(&mut line)
+            .expect("tool response must arrive (server must not hang)");
+    }
     let resp: Value = serde_json::from_str(line.trim()).expect("valid JSON-RPC");
     assert_eq!(resp["result"]["isError"], true, "timeout must surface as isError");
     assert!(
